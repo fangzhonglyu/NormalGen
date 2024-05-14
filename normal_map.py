@@ -5,8 +5,9 @@ from PyQt5.QtWidgets import QApplication, QWidget, QLabel, QVBoxLayout, QFileDia
 from PyQt5.QtGui import QKeyEvent, QPixmap, QImage, QColor, QPainter, QPen
 from PyQt5.QtCore import Qt
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 from scipy.interpolate import RBFInterpolator
+import cv2
 
 
 from segment_anything import SamPredictor, sam_model_registry
@@ -82,8 +83,12 @@ def multiply_image(seg_temp: np.ndarray) -> QImage:
     mask = seg_temp.copy()
     mask = (mask + 1) / 2
     #duplicate the mask to 3 channels (x, y, 3)
-    mask = np.stack([mask, mask, mask], axis=-1)
+    if(len(mask.shape) == 2):
+        mask = np.stack([mask, mask, mask], axis=-1)
+    elif(len(mask.shape) == 3 and mask.shape[2] == 1):
+        mask = np.concatenate((mask, mask, mask), axis=2)
     img_temp = img_arr * mask
+
     
     img = img_temp.astype(np.uint8)
     img = QImage(img.data, img.shape[1], img.shape[0], img.shape[1] * 3, QImage.Format_RGB888)
@@ -101,7 +106,10 @@ def raw_normal_map_with_mask(width, height, mask):
     # set every pixel to 128, 128, 255
     img = np.zeros((height, width, 3), dtype=np.uint8)
     img[:, :] = [128, 128, 255]
-    img = img * mask[:, :, np.newaxis]
+    if(len(mask.shape) == 3 and mask.shape[2] == 3):
+        img = img * mask
+    else:
+        img = img * mask[:, :, np.newaxis]
     img = img.astype(np.uint8)
     return img
 
@@ -282,6 +290,8 @@ def combine_normals():
 max_width = 600
 max_height = 400
 
+flood = True
+
 class NormalMap(QWidget):
     def __init__(self, image_path):
         super().__init__()
@@ -328,9 +338,9 @@ class NormalMap(QWidget):
         button7.mouseReleaseEvent = self.showCombined
         button7.setFixedWidth(150)
         
-        button8 = QPushButton("Lights")
-        button8.mouseReleaseEvent = self.adjLight
-        button8.setFixedWidth(100)
+        self.button8 = QPushButton("Flood Fill")
+        self.button8.mouseReleaseEvent = self.toggleFill
+        self.button8.setFixedWidth(150)
         
         button9 = QPushButton("Render")
         button9.mouseReleaseEvent = self.render
@@ -342,11 +352,11 @@ class NormalMap(QWidget):
         menu_bar.addWidget(button1)
         menu_bar.addWidget(button2)
         menu_bar.addWidget(button3)
-
         menu_bar.addWidget(button5)
+        menu_bar.addWidget(self.button8)
+        
         menu_bar.addWidget(button6)
         menu_bar.addWidget(button7)
-        menu_bar.addWidget(button8)
         menu_bar.addWidget(button9)
         
         menu_bar.setAlignment(Qt.AlignTop)
@@ -404,6 +414,14 @@ class NormalMap(QWidget):
         combined_normal = combine_normals()
         self.label_right.setPixmap(QPixmap.fromImage(QImage(combined_normal.data, combined_normal.shape[1], combined_normal.shape[0], combined_normal.shape[1] * 3, QImage.Format_RGB888)).scaled(max_width, max_height, Qt.AspectRatioMode.KeepAspectRatio))
         
+    def toggleFill(self, event):
+        global flood
+        flood = not flood
+        if(flood):
+            self.button8.setText("Flood Fill")
+        else:
+            self.button8.setText("SAM Predict")
+    
     def updateSelectedMask(self):
         selMask = self.list.currentRow() - 1
         if(selMask != self.selectedMask):
@@ -458,13 +476,29 @@ class NormalMap(QWidget):
             return
         for i in range(len(seg_points)):
             seg_points[i] = label_to_img_coords(self.label_left, self.original, seg_points[i][0], seg_points[i][1])
-        seg_temp = predict(np.array(seg_points),np.array(seg_label))
+        
+        if flood:
+            seg_temp = img_arr.copy()  
+            # run flood fill algorithm to segment the region
+            fill_mask = np.zeros((img_arr.shape[0]+2, img_arr.shape[1]+2), np.uint8)
+            cv2.floodFill(seg_temp, fill_mask, (int(seg_points[0][0]),int(seg_points[0][1])), (1,1,1), 10, 10)[1]
+            # Extract the filled region from the mask
+            seg_temp = fill_mask[1:-1, 1:-1]  # Remove the extra 1-pixel border
+        
+        else:
+            seg_temp = predict(np.array(seg_points), np.array(seg_label))
+            seg_temp = seg_temp[0]
+        
         seg_points.clear()
         seg_label.clear()
         
         #convert seg_region to a mask, seg_region is of shape (1, img_height, img_width) and True/False
-        seg_temp = seg_temp[0]
+        
         seg_temp = seg_temp.astype(np.uint8)
+        
+        # apply median filter to smooth the mask
+        seg_temp = cv2.medianBlur(seg_temp, 7)
+        print("SHAPE",seg_temp.shape)
         
         seg_region.append(seg_temp)
         lines.append([])
